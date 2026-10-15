@@ -1,0 +1,27 @@
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --panel-2: #1c232d;
+  --border: #2b3441;
+  --text: #e6edf3;
+  --muted: #8b98a8;
+  --accent: #4f9cff;
+  --good: #3fb68b;
+  --warn: #e3a948;
+  --bad: #ef6b6b;
+  --c-Service: #4f9cff;
+  --c-Incident: #ef6b6b;
+  --c-Repository: #a78bfa;
+  --c-Engineer: #3fb68b;
+  --c-Deployment: #e3a948;
+  font: 16px/1.5 system-ui, 'Segoe UI', Roboto, sans-serif;
+  color-scheme: dark;
+  color: var(--text);
+  background: var(--bg);
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; }
+h1, h2, h3, p { margin: 0; }
+code, pre { font-family: ui-monospace, Consolas, monospace; }
+a { color: var(--accent); }
