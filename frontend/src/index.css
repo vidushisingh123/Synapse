@@ -1,27 +1,90 @@
+/* Synapse identity: warm ivory workspace, deep forest chrome, one restrained lime accent.
+   Light tokens are the default. `.on-dark` surfaces (sidebar, graph canvas) re-map the same
+   token names, so shared components (buttons, labels, focus rings) adapt automatically. */
 :root {
-  --bg: #0d1117;
-  --panel: #161b22;
-  --panel-2: #1c232d;
-  --border: #2b3441;
-  --text: #e6edf3;
-  --muted: #8b98a8;
-  --accent: #4f9cff;
-  --good: #3fb68b;
-  --warn: #e3a948;
-  --bad: #ef6b6b;
-  --c-Service: #4f9cff;
-  --c-Incident: #ef6b6b;
-  --c-Repository: #a78bfa;
-  --c-Engineer: #3fb68b;
-  --c-Deployment: #e3a948;
-  font: 16px/1.5 system-ui, 'Segoe UI', Roboto, sans-serif;
-  color-scheme: dark;
+  /* palette */
+  --forest-900: #17251F;
+  --forest-800: #24372D;
+  --forest-700: #30483A;
+  --ivory: #F5F3EC;
+  --lime: #C5D96B;
+
+  /* light surfaces */
+  --bg: #F5F3EC;
+  --panel: #FBFAF6;
+  --panel-2: #F0EDE3;
+  --panel-3: #E8E4D7;
+  --raised: #FFFEFB;
+  --border: #E5E1D6;
+  --border-strong: #CBC6B5;
+  --control-border: #858F83; /* outlines of inputs and buttons: >= 3:1 on the light panels */
+
+  /* text (muted is darkened from #777D75 so small text keeps AA contrast on ivory) */
+  --text: #17251F;
+  --text-2: #3A4840;
+  --muted: #5E655D;
+  --link: #2B5E41;
+  --focus: #24372D;
+
+  /* actions and accent */
+  --primary-bg: var(--forest-900);
+  --primary-fg: var(--ivory);
+  --primary-hover: var(--forest-800);
+  --accent: var(--lime);
+  --accent-ink: #17251F;
+  --accent-soft: rgba(197, 217, 107, 0.32);
+  --accent-line: rgba(122, 143, 36, 0.55);
+
+  /* status (all >= 4.5:1 on the light panels) */
+  --good: #1F6B46;
+  --warn: #8A5B12;
+  --bad: #A63D2F;
+
+  --radius: 10px;
+
+  /* graph entity colours: tuned for the dark canvas, each also has its own marker shape */
+  --c-Service: #C5D96B;
+  --c-Engineer: #8FD3B6;
+  --c-Repository: #D8CBA0;
+  --c-Incident: #E88C72;
+  --c-Deployment: #7FB2C9;
+
+  --sans: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --serif: Charter, 'Iowan Old Style', 'Palatino Linotype', 'Book Antiqua', Georgia, serif;
+  --mono: ui-monospace, 'SF Mono', Consolas, monospace;
+
+  font: 16px/1.5 var(--sans);
+  color-scheme: light;
   color: var(--text);
   background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+.on-dark {
+  --text: #F5F3EC;
+  --text-2: #D5DCD2;
+  --muted: #A7B5AA;
+  --link: #C5D96B;
+  --focus: #C5D96B;
+  --panel: #17251F;
+  --panel-2: #24372D;
+  --panel-3: #30483A;
+  --border: #2F4639;
+  --border-strong: #46604F;
+  --control-border: #6A8776;
+  --primary-bg: #C5D96B;
+  --primary-fg: #17251F;
+  --primary-hover: #D6E68C;
+  --good: #8FD3B6;
+  --warn: #E3B04B;
+  --bad: #F09A85;
+  color-scheme: dark;
+  color: var(--text);
 }
 
 * { box-sizing: border-box; }
-body { margin: 0; }
+body { margin: 0; background: var(--bg); }
 h1, h2, h3, p { margin: 0; }
-code, pre { font-family: ui-monospace, Consolas, monospace; }
-a { color: var(--accent); }
+code, pre { font-family: var(--mono); }
+a { color: var(--link); }
+::selection { background: rgba(197, 217, 107, 0.6); color: #17251F; }
