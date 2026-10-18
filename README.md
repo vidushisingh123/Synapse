@@ -255,6 +255,28 @@ Use the following questions as a demo checklist. Their results depend on the cur
 5. **Ownership gaps:** What ownership gaps exist in the graph?
 6. **Knowledge continuity:** If Avery Chen leaves next week, what knowledge is at risk and what handover tasks are most urgent?
 
+## 📸 Screenshots
+
+### 1. Synapse — Landing Page
+The main interface for exploring Synapse and starting engineering investigations.
+
+![Synapse Landing Page](Screenshots/Landing-page.png)
+
+### 2. Interactive Knowledge Graph
+Visualize connections between services, engineers, repositories, and incidents to understand how engineering knowledge is connected.
+
+![Synapse Knowledge Graph](Screenshots/Knowledge-graph.png)
+
+### 3. AI-Powered Incident Investigation
+Explore investigation results and evidence to understand potential causes of engineering incidents.
+
+![Synapse Investigation Demo](Screenshots/Investigation-demo.png)
+
+### 4. Knowledge Continuity & Offboarding Investigation
+Identify knowledge gaps and explore potential risks when an engineer leaves the team.
+
+![Synapse Offboarding Investigation](Screenshots/Offboarding-investigation.png)
+
 ## API overview
 
 The backend has exposed the following routes during development. Verify them against the current server implementation before using them as a stable external API.
@@ -311,7 +333,7 @@ Only report test counts and build results that were observed during the final ve
 
 The demo should show a working investigation, the graph connections behind its findings, evidence supporting the answer, and a knowledge-continuity scenario.
 
-**Demo link:** Add the actual video URL after recording.
+**Demo link:** [Add the actual video URL after recording](https://www.youtube.com/watch?v=3-DrIeaoMNE).
 
 ## AI assistance disclosure
 
@@ -324,6 +346,3 @@ Built for **Graph Hacks: Context for AI Agents**, organized by WeMakeDevs in col
 - Official event: https://www.wemakedevs.org/hackathons/falkordb
 - Rules: https://www.wemakedevs.org/hackathons/falkordb/rules
 
-## License
-
-Add the license that applies to this repository. Do not claim an open-source license unless the repository includes the corresponding license file.
