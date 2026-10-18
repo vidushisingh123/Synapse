@@ -49,6 +49,47 @@ function ModeBadge({ entry }) {
   return null;
 }
 
+const RC_LABELS = {
+  confirmed: { label: 'Confirmed', cls: 'rc-confirmed' },
+  likely:    { label: 'Likely cause', cls: 'rc-likely' },
+  possible:  { label: 'Possible cause', cls: 'rc-possible' },
+  unknown:   { label: 'Unknown', cls: 'rc-unknown' },
+};
+
+function RootCauseSection({ rc }) {
+  if (!rc) return null;
+  const { label, cls } = RC_LABELS[rc.confidence] ?? RC_LABELS.unknown;
+  return (
+    <section className="card root-cause">
+      <h2>Root-cause assessment</h2>
+      <div className="rc-header">
+        <span className={`rc-badge ${cls}`}>{label}</span>
+        <p className="rc-assessment">{rc.assessment || 'No assessment available.'}</p>
+      </div>
+      {rc.causal_chain && (
+        <div className="rc-chain">
+          <span className="rc-label">Causal chain</span>
+          <p>{rc.causal_chain}</p>
+        </div>
+      )}
+      {list(rc.evidence).length > 0 && (
+        <div className="rc-evidence">
+          <span className="rc-label">Supporting evidence</span>
+          <span>{list(rc.evidence).map((id) => <Cites key={id} ids={[id]} />)}</span>
+        </div>
+      )}
+      {list(rc.to_confirm).length > 0 && (
+        <div className="rc-to-confirm">
+          <span className="rc-label">To confirm</span>
+          <ul className="list">
+            {list(rc.to_confirm).map((s, i) => <li key={i}>{s}</li>)}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function Report({ entry }) {
   const r = entry.report;
   const facts = list(r.facts);
@@ -67,6 +108,8 @@ function Report({ entry }) {
         <h2>Summary</h2>
         <p className="summary">{r.summary || 'No summary was returned.'}</p>
       </section>
+
+      <RootCauseSection rc={r.root_cause} />
 
       <div className="grid">
         <section className="card">

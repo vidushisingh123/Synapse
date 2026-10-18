@@ -128,3 +128,29 @@ button:disabled { opacity: 0.6; cursor: not-allowed; }
   .bar::after, .evidence details.flash { animation: none; }
   .sidebar { transition: none; }
 }
+
+/* ── Root-cause assessment section ────────────────────────────────────────── */
+.root-cause { display: grid; gap: 14px; }
+
+.rc-header { display: flex; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+.rc-assessment { flex: 1 1 280px; margin: 0; font-size: 15px; line-height: 1.55; }
+
+.rc-badge {
+  flex-shrink: 0;
+  display: inline-block; font-size: 11px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.06em; padding: 3px 10px; border-radius: 6px; border: 1px solid currentColor;
+  white-space: nowrap; margin-top: 1px;
+}
+.rc-confirmed { color: var(--good); background: rgba(63, 182, 139, 0.12); }
+.rc-likely    { color: var(--accent); background: rgba(79, 156, 255, 0.12); }
+.rc-possible  { color: var(--warn); background: rgba(227, 169, 72, 0.12); }
+.rc-unknown   { color: var(--muted); background: rgba(139, 152, 168, 0.12); }
+
+.rc-chain, .rc-evidence, .rc-to-confirm { display: grid; gap: 6px; }
+.rc-chain p, .rc-evidence p { font-size: 14px; line-height: 1.6; color: var(--muted); margin: 0; }
+.rc-label {
+  font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em;
+  color: var(--muted);
+}
+.rc-evidence span { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.rc-to-confirm .list li { font-size: 14px; }
