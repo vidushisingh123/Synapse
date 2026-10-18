@@ -275,7 +275,7 @@ Explore investigation results and evidence to understand potential causes of eng
 ### 4. Knowledge Continuity & Offboarding Investigation
 Identify knowledge gaps and explore potential risks when an engineer leaves the team.
 
-![Synapse Offboarding Investigation](Screenshots/Offboarding-investigation.png)
+![Synapse Offboarding Investigation](Screenshots/Offboarding-Investigation.png)
 
 ## API overview
 
