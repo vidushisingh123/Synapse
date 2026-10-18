@@ -1,13 +1,82 @@
-import Anthropic from '@anthropic-ai/sdk';
+import Groq from 'groq-sdk';
 import { TOOL_DEFINITIONS, runTool, ToolError } from './graph/tools.js';
 
 const MAX_STEPS = 8;
 
+const MAX_RETRY_WAIT_MS = 20_000; // longest provider-requested wait we will honour (one retry only)
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Strip anything that looks like an API key from text we log or show. */
+export function redact(text) {
+  let out = String(text ?? '').replace(/gsk_[A-Za-z0-9_-]+/g, '[redacted]');
+  const key = process.env.GROQ_API_KEY;
+  if (key) out = out.split(key).join('[redacted]');
+  return out;
+}
+
+/** True for Groq/OpenAI-style HTTP 429 rate-limit errors (and only those). */
+export function isRateLimit(err) {
+  return (
+    err?.status === 429 ||
+    err?.error?.code === 'rate_limit_exceeded' ||
+    err?.error?.error?.code === 'rate_limit_exceeded'
+  );
+}
+
+/** Provider retry guidance in ms from the Retry-After header or the "try again in ..." text; null if absent/invalid. */
+export function parseRetryDelayMs(err) {
+  const h = err?.headers;
+  const header = typeof h?.get === 'function' ? h.get('retry-after') : h?.['retry-after'];
+  if (header != null && header !== '') {
+    const secs = Number(header);
+    if (Number.isFinite(secs) && secs > 0) return Math.round(secs * 1000);
+    const at = Date.parse(header); // HTTP-date form
+    if (Number.isFinite(at) && at > Date.now()) return at - Date.now();
+  }
+  const text = `${err?.error?.message ?? err?.error?.error?.message ?? ''} ${err?.message ?? ''}`;
+  const m = text.match(/try again in\s+((?:\d+(?:\.\d+)?(?:ms|[hms]))+)/i);
+  if (!m) return null;
+  const unitMs = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 };
+  let total = 0;
+  for (const [, n, unit] of m[1].matchAll(/(\d+(?:\.\d+)?)(ms|h|m|s)/gi)) total += Number(n) * unitMs[unit.toLowerCase()];
+  return total > 0 ? Math.round(total) : null;
+}
+
+const formatWait = (ms) => {
+  const s = Math.ceil(ms / 1000);
+  return s < 60 ? `${s}s` : `${Math.ceil(s / 60)} min`;
+};
+
+function fallbackWarning(err) {
+  if (isRateLimit(err)) {
+    const wait = parseRetryDelayMs(err);
+    return `AI analysis is temporarily rate-limited by Groq (HTTP 429)${wait ? `; try again in about ${formatWait(wait)}` : ''}. Showing graph-only analysis in the meantime.`;
+  }
+  return `Groq unavailable (${redact(err.message)}). Showing graph-only analysis.`;
+}
+
+/**
+ * One Groq call with at most ONE retry per investigation, and only for a 429 that carries valid
+ * retry guidance within MAX_RETRY_WAIT_MS. The retry re-sends the same failed request (a 429 produced
+ * no output), so no tool call is ever replayed. A second failure propagates to the graph-only fallback.
+ */
+async function createWithOneRetry(client, params, state, sleep) {
+  try {
+    return await client.chat.completions.create(params);
+  } catch (err) {
+    const wait = isRateLimit(err) ? parseRetryDelayMs(err) : null;
+    if (state.used || wait == null || wait > MAX_RETRY_WAIT_MS) throw err;
+    state.used = true;
+    await sleep(wait + 250); // provider guidance plus a small margin
+    return client.chat.completions.create(params);
+  }
+}
+
 const SYSTEM = `You are Synapse, an investigation agent for a fictional company. You learn about the company ONLY through the provided graph tools.
 
 Process:
-1. Identify the service(s) in the question with search_services.
-2. For the affected service call get_service_dependencies, get_related_incidents, get_recent_deployments, get_repositories and get_engineers.
+1. Call search_services for exact service names, then use only the tools that help answer THIS question: dependencies for "what depends on / what breaks", incidents for history, deployments for likely triggers, repositories and engineers for "who". For a failing service, use all of them.
+2. If the question names no service, incident or engineer that exists in the graph, do not guess a service. Say what is missing.
 3. Write the report.
 
 Rules:
@@ -16,7 +85,8 @@ Rules:
 - "facts" must be directly supported by tool results and cite evidence ids.
 - Anything inferred (likely cause, who is best to investigate) goes in "hypotheses" with confidence "low", "medium" or "high" and supporting evidence ids. Never present a hypothesis as a fact.
 - If evidence is missing (e.g. no repository or owner for a service), list it under "gaps".
-- Reply with ONLY one JSON object, no markdown fences, in exactly this shape:
+- The graph has no live telemetry (errors, latency, logs), so never present a cause as confirmed. If the graph cannot answer the question, say so in "summary" and "gaps" and leave "facts" and "hypotheses" empty.
+- Use the graph tools first. When you have enough evidence, write your final answer as plain assistant text that is one JSON object in exactly the shape below. The JSON is the text of your message, never a tool call: there is no tool named "json" (or "report", "answer" or "final"), so do not call one. Do not use markdown fences or any text outside the object. Shape:
 {"summary": string,
  "affected_services": string[],
  "facts": [{"text": string, "evidence": string[]}],
@@ -39,14 +109,43 @@ function makeRecorder() {
 }
 
 function parseReport(text) {
-  const start = text.indexOf('{');
-  const end = text.lastIndexOf('}');
-  if (start < 0 || end <= start) return null;
-  try {
-    return JSON.parse(text.slice(start, end + 1));
-  } catch {
-    return null;
+  const src = String(text ?? '').replace(/```(?:json)?/gi, '');
+  const start = src.indexOf('{');
+  if (start < 0) return null;
+
+  // 1) First "{" to last "}" (handles prose around the object).
+  const end = src.lastIndexOf('}');
+  if (end > start) {
+    try {
+      return JSON.parse(src.slice(start, end + 1));
+    } catch {
+      /* fall through to the balanced scan */
+    }
   }
+
+  // 2) Balanced scan of the first object (handles trailing text that contains braces).
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < src.length; i++) {
+    const c = src[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === '{') depth++;
+    else if (c === '}' && --depth === 0) {
+      try {
+        return JSON.parse(src.slice(start, i + 1));
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
 }
 
 function normalise(raw, evidence) {
@@ -79,122 +178,423 @@ function normalise(raw, evidence) {
   };
 }
 
+
 async function llmInvestigation(question, rec) {
-  const client = new Anthropic(); // reads ANTHROPIC_API_KEY from the environment
-  const model = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5-5';
-  const messages = [{ role: 'user', content: question }];
+  const client = new Groq({ apiKey: process.env.GROQ_API_KEY, maxRetries: 1 });
+  const model = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
+
+  // TOOL_DEFINITIONS entries are { name, description, input_schema }, and input_schema is already
+  // plain JSON Schema, which is exactly what OpenAI-compatible "parameters" expects.
+  const tools = TOOL_DEFINITIONS.map((t) => ({
+    type: 'function',
+    function: { name: t.name, description: t.description, parameters: t.input_schema },
+  }));
+
+  const messages = [
+    { role: 'system', content: SYSTEM },
+    { role: 'user', content: question },
+  ];
+  let usedModel = model;
 
   for (let step = 0; step < MAX_STEPS; step++) {
-    const resp = await client.messages.create({
-      model,
-      max_tokens: 3000,
-      system: SYSTEM,
-      tools: TOOL_DEFINITIONS,
-      messages,
-    });
-    messages.push({ role: 'assistant', content: resp.content });
+        let resp;
+    try {
+      resp = await client.chat.completions.create({
+        model,
+        messages,
+        tools,
+        // On the last allowed step, forbid more tool calls so the model must write its report.
+        tool_choice: step === MAX_STEPS - 1 ? 'none' : 'auto',
+        temperature: 0.2,
+        max_completion_tokens: 4000,
+        ...(model.includes('gpt-oss') ? { reasoning_effort: 'low' } : {}),
+      });
+    } catch (err) {
+      // Groq rejects a malformed final turn (e.g. a report emitted as a call to a tool named "json")
+      // and returns the model's text as failed_generation. Recover the report from it if we can.
+      const failed = err?.error?.failed_generation ?? err?.error?.error?.failed_generation;
+      const raw = rec.evidence.length && typeof failed === 'string' ? parseReport(failed) : null;
+      if (!raw) throw err;
+      console.warn('Recovered report from a rejected generation:', err.message);
+      return { mode: 'llm', model, report: normalise(raw, rec.evidence), evidence: rec.evidence };
+    }
 
-    if (resp.stop_reason !== 'tool_use') {
-      const text = resp.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
+    usedModel = resp.model || model;
+    const msg = resp.choices?.[0]?.message;
+    if (!msg) throw new Error('Groq returned no message.');
+    const calls = msg.tool_calls ?? [];
+
+    if (calls.length === 0) {
+      // Never accept a report that was written without querying the graph.
+      if (!rec.evidence.length) throw new Error('Model answered without querying the graph.');
+
+      const text = msg.content ?? '';
       const raw = parseReport(text);
       const report = raw
         ? normalise(raw, rec.evidence)
-        : { summary: text, affected_services: [], facts: [], hypotheses: [], recommended_engineers: [], next_steps: [], gaps: ['Model did not return structured JSON.'] };
-      return { mode: 'llm', model, report, evidence: rec.evidence };
+        : {
+            summary: text,
+            affected_services: [],
+            facts: [],
+            hypotheses: [],
+            recommended_engineers: [],
+            next_steps: [],
+            gaps: ['Model did not return structured JSON.'],
+          };
+      return { mode: 'llm', model: usedModel, report, evidence: rec.evidence };
     }
 
-    const results = [];
-    for (const block of resp.content.filter((b) => b.type === 'tool_use')) {
+    // Echo the assistant's tool-call turn back, then answer every call with a role:"tool" message.
+    messages.push({
+      role: 'assistant',
+      content: msg.content ?? null,
+      tool_calls: calls.map((c) => ({
+        id: c.id,
+        type: 'function',
+        function: { name: c.function.name, arguments: c.function.arguments },
+      })),
+    });
+
+    for (const call of calls) {
+      let content;
       try {
-        const { id, data } = await rec.call(block.name, block.input);
-        results.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify({ evidence_id: id, data }) });
+        let args;
+        try {
+          args = JSON.parse(call.function.arguments || '{}');
+        } catch {
+          throw new ToolError('Tool arguments were not valid JSON.');
+        }
+        if (!args || typeof args !== 'object') args = {};
+        const { id, data } = await rec.call(call.function.name, args);
+        content = JSON.stringify({ evidence_id: id, data });
       } catch (err) {
-        results.push({ type: 'tool_result', tool_use_id: block.id, is_error: true, content: err.message });
+        content = JSON.stringify({ error: err.message });
       }
+      messages.push({ role: 'tool', tool_call_id: call.id, content });
     }
-    messages.push({ role: 'user', content: results });
   }
   throw new Error('Agent did not finish within the step limit.');
 }
 
-async function graphOnlyInvestigation(question, rec, warning) {
-  const { data: found } = await rec.call('search_services', {});
-  const lower = question.toLowerCase();
-  const target =
-    found.services.find((n) => lower.includes(n.toLowerCase())) ||
-    found.services.find((n) => lower.includes(n.toLowerCase().split(' ')[0]));
-  if (!target) {
-    throw new ToolError(`Could not tell which service this is about. Known services: ${found.services.join(', ')}`);
+
+// ---------- Graph-only mode: question understanding ----------
+
+const STOPWORDS = new Set(
+  `about after again also and any are because been before being between both but can could did does for from had has have how into its just like more most not now only other our out please should show some such than that the their them then there these they this those through very was were what when where which while who why will with would you your investigate investigation likely cause causes identify find relevant recommend list give tell service services incident incidents engineer engineers failing failed fails issue issues problem problems past previous recent`.split(/\s+/),
+);
+const stem = (w) => w.replace(/(ing|ed|es|s)$/, '');
+const words = (text) =>
+  (String(text ?? '').toLowerCase().match(/[a-z0-9]{4,}/g) ?? []).filter((w) => !STOPWORDS.has(w)).map(stem);
+const unique = (a) => [...new Set(a)];
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const INTENT_PATTERNS = {
+  failure: /\b(fail\w*|error\w*|broken|outage\w*|time[ds]? ?out\w*|timing out|slow\w*|latenc\w*|crash\w*|degrad\w*|not working|issue\w*|problem\w*|root cause|cause\w*|why)\b|\b(is|are|went|keeps?) down\b/i,
+  dependency: /\b(depend\w*|upstream|downstream|impact\w*|affect\w*|blast radius|breaks?|rel(?:y|ies))\b/i,
+  incident: /\b(incidents?|inc-\d+|past|previous\w*|histor\w*|similar|before|outages?|postmortems?)\b/i,
+  deployment: /\b(deploy\w*|releas\w*|rollouts?|rolled out|version\w*|regress\w*|changes?|changed)\b/i,
+  engineer: /\b(who|whom|engineers?|owners?|owns?|owned|maintain\w*|experts?|expertise|on-?call|contact|responsible|assign\w*|investigat\w*)\b/i,
+  repo: /\b(repos?|repositor\w*|code|github|source)\b/i,
+};
+const INTENT_LABELS = {
+  failure: 'failure analysis', dependency: 'dependencies/impact', incident: 'past incidents',
+  deployment: 'recent changes', engineer: 'people/ownership', repo: 'repositories',
+};
+const TOOL_ORDER = ['get_service_dependencies', 'get_related_incidents', 'get_recent_deployments', 'get_repositories', 'get_engineers'];
+
+function detectIntents(question) {
+  return Object.fromEntries(Object.entries(INTENT_PATTERNS).map(([k, re]) => [k, re.test(question)]));
+}
+
+function toolPlan(i) {
+  const plan = new Set();
+  if (i.failure) TOOL_ORDER.forEach((t) => plan.add(t));
+  if (i.dependency) plan.add('get_service_dependencies');
+  if (i.incident) plan.add('get_related_incidents');
+  if (i.deployment) plan.add('get_recent_deployments');
+  if (i.engineer) { plan.add('get_engineers'); plan.add('get_repositories'); }
+  if (i.repo) plan.add('get_repositories');
+  if (!plan.size) ['get_service_dependencies', 'get_related_incidents', 'get_repositories', 'get_engineers'].forEach((t) => plan.add(t));
+  return TOOL_ORDER.filter((t) => plan.has(t));
+}
+
+function mentionedServices(question, names) {
+  const hits = [];
+  for (const name of names) {
+    const first = name.split(' ')[0];
+    const m =
+      question.match(new RegExp(`\\b${escapeRe(name)}\\b`, 'i')) ||
+      question.match(new RegExp(`\\b${escapeRe(first)}(s|es)?\\b`, 'i'));
+    if (m) hits.push({ name, at: m.index });
+  }
+  return hits.sort((a, b) => a.at - b.at).map((h) => h.name);
+}
+
+/** Discovery scan over the existing tools (not recorded as evidence). Used only when no service is named. */
+async function scanGraph(serviceNames) {
+  const incidents = new Map();
+  const engineers = new Map();
+  for (const service of serviceNames) {
+    const inc = await runTool('get_related_incidents', { service });
+    for (const i of inc.incidents) {
+      if (!incidents.has(i.id)) incidents.set(i.id, { ...i, services: new Set() });
+      i.links.forEach((l) => incidents.get(i.id).services.add(l.service));
+    }
+    const eng = await runTool('get_engineers', { service });
+    for (const e of eng.engineers) {
+      if (!engineers.has(e.name)) engineers.set(e.name, { name: e.name, services: new Set() });
+      [...e.maintains, ...e.investigated, ...e.authoredDeployments].forEach((x) => engineers.get(e.name).services.add(x.service));
+    }
+  }
+  return { incidents: [...incidents.values()], engineers: [...engineers.values()] };
+}
+
+async function resolveFocus(question, names) {
+  const askedIncidents = unique((question.match(/\binc-\d+\b/gi) ?? []).map((s) => s.toUpperCase()));
+  const none = { targets: [], incidentIds: askedIncidents, engineerNames: [], via: 'nothing' };
+
+  const services = mentionedServices(question, names);
+  if (services.length) return { targets: services.slice(0, 3), incidentIds: askedIncidents, engineerNames: [], via: 'service name' };
+
+  const scan = await scanGraph(names);
+
+  const byId = scan.incidents.filter((i) => askedIncidents.includes(i.id));
+  if (byId.length) {
+    return { targets: unique(byId.flatMap((i) => [...i.services])).slice(0, 3), incidentIds: byId.map((i) => i.id), engineerNames: [], via: 'incident id' };
   }
 
-  const deps = await rec.call('get_service_dependencies', { service: target });
-  const inc = await rec.call('get_related_incidents', { service: target });
-  const dep = await rec.call('get_recent_deployments', { service: target });
-  const repo = await rec.call('get_repositories', { service: target });
-  const eng = await rec.call('get_engineers', { service: target });
-
-  const facts = [
-    {
-      text: `${target} depends on: ${deps.data.dependsOn.map((x) => x.name).join(', ') || 'nothing recorded'}.`,
-      evidence: [deps.id],
-    },
-  ];
-  for (const i of inc.data.incidents) {
-    const links = i.links.map((l) => `${l.relationship.toLowerCase()} ${l.service}`).join(', ');
-    facts.push({ text: `${i.id} "${i.title}" (${i.status}, ${i.severity}) - ${links}.`, evidence: [inc.id] });
-  }
-  const latest = dep.data.deployments[0];
-  if (latest) {
-    facts.push({
-      text: `Most recent deployment in scope: ${latest.id} (${latest.service} ${latest.version}, ${latest.deployedAt}): ${latest.summary}`,
-      evidence: [dep.id],
-    });
+  const q = question.toLowerCase();
+  const engs = scan.engineers.filter((e) =>
+    e.name.toLowerCase().split(' ').some((p) => p.length > 2 && new RegExp(`\\b${escapeRe(p)}\\b`).test(q)),
+  );
+  if (engs.length) {
+    return { targets: unique(engs.flatMap((e) => [...e.services])).slice(0, 3), incidentIds: [], engineerNames: engs.map((e) => e.name), via: 'engineer name' };
   }
 
-  const hypotheses = [];
-  if (latest) {
-    const prior = inc.data.incidents.find((i) => i.rootCause && i.links.some((l) => l.service === latest.service));
-    hypotheses.push({
-      text: `${latest.id} may have triggered the failure.${prior ? ` It resembles ${prior.id}, whose recorded root cause was: ${prior.rootCause}` : ''}`,
-      confidence: prior ? 'medium' : 'low',
-      evidence: prior ? [dep.id, inc.id] : [dep.id],
-    });
+  const qWords = new Set(words(question));
+  const scored = scan.incidents
+    .map((i) => ({ i, hits: unique(words(`${i.title} ${i.rootCause} ${i.resolution}`).filter((w) => qWords.has(w))) }))
+    .filter((x) => x.hits.length)
+    .sort((a, b) => b.hits.length - a.hits.length)
+    .slice(0, 2);
+  if (scored.length) {
+    return { targets: unique(scored.flatMap((x) => [...x.i.services])).slice(0, 3), incidentIds: scored.map((x) => x.i.id), engineerNames: [], via: 'incident text match' };
   }
+  return none;
+}
 
-  const gaps = repo.data.servicesWithoutRepository.map((s) => `No repository recorded for ${s}.`);
-  const top = eng.data.engineers.slice(0, 2);
+function limitationResult(names, listId, focus, rec, warning) {
   return {
     mode: 'graph-only',
     warning,
     report: {
-      summary: `Focus: ${target}. Found ${inc.data.incidents.length} related past incident(s) and ${dep.data.deployments.length} recent deployment(s) within its dependency scope.`,
-      affected_services: [target, ...deps.data.dependents.map((d) => d.name)],
+      summary: "I couldn't tie this question to any service, incident or engineer in the graph, so I won't guess a cause or an owner.",
+      affected_services: [],
+      facts: [{ text: `The graph contains these services: ${names.join(', ') || 'none'}.`, evidence: [listId] }],
+      hypotheses: [],
+      recommended_engineers: [],
+      next_steps: [
+        `Rephrase with a service name, e.g. "Why is ${names[0] ?? 'Checkout API'} failing?"`,
+        'Or ask about an incident ID (e.g. INC-101) or an engineer by name.',
+      ],
+      gaps: [
+        'No matching service, incident ID, engineer name or incident keyword was found in the question.',
+        ...focus.incidentIds.map((id) => `${id} does not exist in the graph.`),
+      ],
+    },
+    evidence: rec.evidence,
+  };
+}
+
+// ---------- Graph-only mode: investigation ----------
+
+async function graphOnlyInvestigation(question, rec, warning) {
+  const { id: listId, data: found } = await rec.call('search_services', {});
+  const names = found.services;
+  const focus = await resolveFocus(question, names);
+  if (!focus.targets.length) return limitationResult(names, listId, focus, rec, warning);
+
+  const intents = detectIntents(question);
+  if (focus.engineerNames.length) intents.engineer = true;
+  if (focus.incidentIds.length) intents.incident = true;
+  const plan = toolPlan(intents);
+
+  const results = [];
+  for (const target of focus.targets) {
+    const r = { target };
+    for (const tool of plan) r[tool] = await rec.call(tool, { service: target });
+    results.push(r);
+  }
+
+  const facts = [];
+  const hypotheses = [];
+  const gaps = [];
+  const fmt = (rows) =>
+    rows.length ? rows.map((x) => `${x.name}${x.depth > 1 ? ` (${x.depth} hops)` : ''}`).join(', ') : 'nothing recorded';
+
+  // Dependencies
+  for (const r of results) {
+    const d = r.get_service_dependencies;
+    if (d) {
+      facts.push({
+        text: `${r.target} depends on: ${fmt(d.data.dependsOn)}; depended on by: ${fmt(d.data.dependents)}.`,
+        evidence: [d.id],
+      });
+    }
+  }
+
+  // Incidents
+  const seenInc = new Set();
+  for (const r of results) {
+    const inc = r.get_related_incidents;
+    if (!inc) continue;
+    let list = inc.data.incidents;
+    if (focus.incidentIds.length) list = list.filter((i) => focus.incidentIds.includes(i.id));
+    list = list.filter((i) => !seenInc.has(i.id));
+    if (!list.length && !focus.incidentIds.length) gaps.push(`No past incidents are recorded for ${r.target} or its dependencies.`);
+    for (const i of list) {
+      seenInc.add(i.id);
+      const links = i.links.map((l) => `${l.relationship.toLowerCase()} ${l.service}`).join(', ');
+      facts.push({
+        text: `${i.id} "${i.title}" (${i.status}, ${i.severity}): ${links}. Recorded root cause: ${i.rootCause ?? 'not recorded'}. Resolution: ${i.resolution ?? 'not recorded'}.`,
+        evidence: [inc.id],
+      });
+    }
+  }
+  for (const id of focus.incidentIds) {
+    if (plan.includes('get_related_incidents') && !seenInc.has(id)) gaps.push(`${id} was not found in the retrieved graph evidence.`);
+  }
+
+  // Deployments
+  const seenDep = new Set();
+  for (const r of results) {
+    const dep = r.get_recent_deployments;
+    if (!dep) continue;
+    const list = dep.data.deployments.filter((d) => !seenDep.has(d.id)).slice(0, 3);
+    if (!dep.data.deployments.length) gaps.push(`No deployments are recorded in scope for ${r.target}.`);
+    for (const d of list) {
+      seenDep.add(d.id);
+      facts.push({ text: `Deployment ${d.id} (${d.service} ${d.version}, ${d.deployedAt}): ${d.summary}`, evidence: [dep.id] });
+    }
+  }
+
+  // Repositories
+  for (const r of results) {
+    const repo = r.get_repositories;
+    if (!repo) continue;
+    if (repo.data.repositories.length) {
+      facts.push({
+        text: `Repositories in scope of ${r.target}: ${repo.data.repositories.map((x) => `${x.service} -> ${x.repository}`).join(', ')}.`,
+        evidence: [repo.id],
+      });
+    }
+    repo.data.servicesWithoutRepository.forEach((s) => gaps.push(`No repository (so no recorded maintainer) for ${s}.`));
+  }
+
+  // Engineers
+  const engMap = new Map();
+  for (const r of results) {
+    const eng = r.get_engineers;
+    if (!eng) continue;
+    if (!eng.data.engineers.length) gaps.push(`No engineers are linked to ${r.target} or its dependencies in the graph.`);
+    for (const p of eng.data.engineers) {
+      if (focus.engineerNames.length && !focus.engineerNames.includes(p.name)) continue;
+      const cur = engMap.get(p.name);
+      if (!cur || p.score > cur.p.score) engMap.set(p.name, { p, id: eng.id });
+    }
+  }
+  const people = [...engMap.values()].sort((a, b) => b.p.score - a.p.score).slice(0, 3);
+  const ids = (arr, k) => unique(arr.map((x) => x[k])).join(', ') || 'none';
+  for (const { p, id } of people) {
+    facts.push({
+      text: `${p.name} (${p.expertise ?? 'expertise not recorded'}): maintains ${ids(p.maintains, 'repository')}; investigated ${ids(p.investigated, 'incident')}; authored deployments ${ids(p.authoredDeployments, 'deployment')}.`,
+      evidence: [id],
+    });
+  }
+
+  // Hypotheses: only for failure / change questions, never presented as confirmed
+  if (intents.failure || intents.deployment) {
+    for (const r of results) {
+      const dep = r.get_recent_deployments;
+      const latest = dep?.data.deployments[0];
+      if (!latest) continue;
+      const inc = r.get_related_incidents;
+      const svcWords = new Set(words(latest.service));
+      const depWords = new Set(words(latest.summary).filter((w) => !svcWords.has(w)));
+      let best = null;
+      for (const i of inc?.data.incidents ?? []) {
+        if (!i.rootCause || !i.links.some((l) => l.service === latest.service)) continue;
+        const shared = unique(words(i.rootCause)).filter((w) => depWords.has(w));
+        if (shared.length >= 2 && (!best || shared.length > best.shared.length)) best = { i, shared };
+      }
+      hypotheses.push({
+        text:
+          `${latest.id} (${latest.service} ${latest.version}, ${latest.deployedAt}) is the most recent deployment in ${r.target}'s dependency scope and could be a trigger.` +
+          (best ? ` Its change resembles ${best.i.id}, whose recorded root cause was "${best.i.rootCause}" (shared terms: ${best.shared.join(', ')}).` : '') +
+          ' This is a correlation in the graph, not a confirmed cause.',
+        confidence: best ? 'medium' : 'low',
+        evidence: best ? [dep.id, inc.id] : [dep.id],
+      });
+    }
+    if (intents.failure) {
+      if (!hypotheses.length) gaps.push(`The graph holds no deployment or incident evidence that points to a likely cause for ${focus.targets.join(', ')}.`);
+      gaps.push('The graph has no live telemetry (errors, latency, logs), so no cause can be confirmed from it.');
+    }
+  }
+
+  // Summary, affected services, next steps
+  const label = Object.keys(intents).filter((k) => intents[k]).map((k) => INTENT_LABELS[k]).join(', ') || 'overview';
+  const wantsImpact = intents.failure || intents.dependency || !(intents.incident || intents.deployment || intents.engineer || intents.repo);
+  const affected =
+    focus.via === 'engineer name'
+      ? []
+      : unique([
+          ...focus.targets,
+          ...(wantsImpact ? results.flatMap((r) => r.get_service_dependencies?.data.dependents.map((d) => d.name) ?? []) : []),
+        ]);
+
+  const next = [];
+  if (intents.failure) {
+    next.push(`Check live error rates and latency for ${focus.targets[0]} and its direct dependencies (the graph holds no telemetry).`);
+    if (hypotheses.length) next.push("Compare the latest deployment's change with the recorded root cause of similar past incidents.");
+  }
+  if (intents.incident) next.push('Read the resolution of the closest past incident before changing anything.');
+  if (people.length) next.push('Confirm ownership with your on-call rota; the engineer ranking is a heuristic from graph links.');
+  if (intents.dependency) next.push('Validate dependency edges against real service configs; the graph may be incomplete.');
+  if (!next.length) next.push('Ask a more specific question, e.g. about failures, dependencies, past incidents or owners.');
+
+  return {
+    mode: 'graph-only',
+    warning,
+    report: {
+      summary: `Interpreted as: ${label}. Focus: ${focus.targets.join(', ')} (matched by ${focus.via}). Tools used: ${plan.map((t) => t.replace('get_', '')).join(', ')}. ${facts.length} graph-supported fact(s), ${hypotheses.length} unconfirmed hypothesis(es), ${unique(gaps).length} gap(s).`,
+      affected_services: affected,
       facts,
       hypotheses,
-      recommended_engineers: top.map((e) => ({
-        name: e.name,
-        reason: `Ranked by graph relationships: maintains ${e.maintains.length} repo link(s), investigated ${e.investigated.length} incident link(s), authored ${e.authoredDeployments.length} deployment(s).`,
-        evidence: [eng.id],
+      recommended_engineers: people.map(({ p, id }) => ({
+        name: p.name,
+        reason: `Heuristic ranking from graph links, not a confirmed owner: ${p.maintains.length} repo link(s), ${unique(p.investigated.map((x) => x.incident)).length} incident(s) investigated, ${p.authoredDeployments.length} deployment(s) authored.`,
+        evidence: [id],
       })),
-      next_steps: [
-        'Compare the latest deployment diff against the recorded root cause of the most similar past incident.',
-        'Check error rates and latency on the service and its direct dependencies.',
-        'Page the top recommended engineer and share this evidence list.',
-      ],
-      gaps,
+      next_steps: next,
+      gaps: unique(gaps),
     },
     evidence: rec.evidence,
   };
 }
 
 export async function investigate(question) {
-  if (process.env.ANTHROPIC_API_KEY) {
+  if (process.env.GROQ_API_KEY) {
     try {
       return await llmInvestigation(question, makeRecorder());
     } catch (err) {
-      console.error('LLM investigation failed, using graph-only mode:', err.message);
-      return graphOnlyInvestigation(question, makeRecorder(), `LLM unavailable (${err.message}). Showing graph-only analysis.`);
+      console.error('Groq investigation failed, using graph-only mode:', err.message);
+      return graphOnlyInvestigation(
+        question,
+        makeRecorder(),
+        `Groq unavailable (${err.message}). Showing graph-only analysis.`,
+      );
     }
   }
-  return graphOnlyInvestigation(question, makeRecorder(), 'ANTHROPIC_API_KEY is not set. Showing graph-only analysis.');
+  return graphOnlyInvestigation(question, makeRecorder(), 'GROQ_API_KEY is not set. Showing graph-only analysis.');
 }

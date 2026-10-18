@@ -4,23 +4,26 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-  "start": "node src/server.js",
-  "dev": "nodemon src/server.js",
-  "test-graph": "node test-graph.js",
-  "seed-graph": "node seed-graph.js",
-  "seed-demo": "node seed-demo.js",
-  "test-tools": "node test-tools.js"
-},
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "test-graph": "node test-graph.js",
+    "seed-graph": "node seed-graph.js",
+    "seed-demo": "node seed-demo.js",
+    "test-tools": "node test-tools.js",
+    "test": "node --test"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.134.0",
+    "@google/genai": "^2.30.0",
     "cors": "^2.8.6",
     "dotenv": "^18.0.8",
     "express": "^5.3.0",
-    "falkordb": "^6.8.0"
+    "falkordb": "^6.8.0",
+    "groq-sdk": "^1.6.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"

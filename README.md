@@ -1,6 +1,6 @@
 # Synapse
 
-AI-powered company knowledge graph and investigation agent (WeMakeDevs × FalkorDB Graph Hacks).
+AI-powered company knowledge graph and investigation agent .
 All data is synthetic and fictional.
 
 ## Architecture

@@ -18,7 +18,7 @@ const withTimeout = (promise, ms) =>
 app.get('/api/health', async (_req, res) => {
   try {
     const rows = await withTimeout(query('MATCH (n) RETURN count(n) AS nodes'), 3000);
-    res.json({ status: 'ok', graph: GRAPH_NAME, nodes: rows[0]?.nodes ?? 0, llmConfigured: Boolean(process.env.ANTHROPIC_API_KEY) });
+    res.json({ status: 'ok', graph: GRAPH_NAME, nodes: rows[0]?.nodes ?? 0,   llmConfigured: Boolean(process.env.GROQ_API_KEY) });
   } catch (err) {
     res.status(503).json({ status: 'down', error: err.message });
   }
