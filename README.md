@@ -333,7 +333,7 @@ Only report test counts and build results that were observed during the final ve
 
 The demo should show a working investigation, the graph connections behind its findings, evidence supporting the answer, and a knowledge-continuity scenario.
 
-**Demo link:** [Add the actual video URL after recording](https://www.youtube.com/watch?v=3-DrIeaoMNE).
+**Demo link:** [For Demo Video- Click here](https://www.youtube.com/watch?v=3-DrIeaoMNE).
 
 ## AI assistance disclosure
 
