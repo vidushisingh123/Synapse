@@ -190,6 +190,120 @@ export const TOOLS = {
       return { service, searchedServices: names, engineers };
     },
   },
+
+  get_offboarding_risk: {
+    description:
+      'Given an engineer name, returns the services they solely maintain (no other maintainer on record), services with no maintainer at all, incidents they uniquely investigated, their recent deployments (institutional knowledge at risk), and the blast-radius services that depend on their services. Use this for offboarding, knowledge-continuity, or bus-factor questions.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        engineer: { type: 'string', description: 'Full engineer name, e.g. "Avery Chen"' },
+      },
+      required: ['engineer'],
+    },
+    async run({ engineer } = {}) {
+      const name = String(engineer ?? '').trim();
+      if (!name) throw new ToolError('engineer name is required');
+
+      // Verify engineer exists
+      const engRows = await query(
+        'MATCH (e:Engineer {name: $name}) RETURN e.name AS name, e.expertise AS expertise',
+        { name },
+      );
+      if (!engRows.length) {
+        const all = await query('MATCH (e:Engineer) RETURN e.name AS name ORDER BY name');
+        throw new ToolError(
+          `No engineer named "${name}" in the graph. Known engineers: ${all.map((r) => r.name).join(', ')}`,
+        );
+      }
+      const expertise = engRows[0].expertise ?? null;
+
+      // 1. Services this engineer maintains (via MAINTAINS→Repository←IMPLEMENTED_IN)
+      const maintainedRows = await query(
+        `MATCH (e:Engineer {name: $name})-[:MAINTAINS]->(r:Repository)<-[:IMPLEMENTED_IN]-(s:Service)
+         RETURN s.name AS service, r.name AS repository`,
+        { name },
+      );
+
+      // 2. For each maintained repo, find other maintainers
+      const ownedServices = [];
+      const soloMaintained = [];
+      for (const row of maintainedRows) {
+        const others = await query(
+          `MATCH (r:Repository {name: $repo})<-[:MAINTAINS]-(other:Engineer)
+           WHERE other.name <> $name
+           RETURN other.name AS name`,
+          { repo: row.repository, name },
+        );
+        const otherMaintainers = others.map((r) => r.name);
+        ownedServices.push({
+          service: row.service,
+          repository: row.repository,
+          hasOtherMaintainer: otherMaintainers.length > 0,
+          otherMaintainers,
+        });
+        if (!otherMaintainers.length) soloMaintained.push(row.service);
+      }
+
+      // 3. Services with NO maintainer at all (no Engineer→MAINTAINS→Repo←IMPLEMENTED_IN path)
+      const unownedRows = await query(
+        `MATCH (s:Service)
+         WHERE NOT (s)-[:IMPLEMENTED_IN]->(:Repository)<-[:MAINTAINS]-(:Engineer)
+         RETURN s.name AS name ORDER BY name`,
+      );
+      const unownedServices = unownedRows.map((r) => r.name);
+
+      // 4. Incidents uniquely investigated by this engineer (no other investigator on record)
+      const incidentRows = await query(
+        `MATCH (e:Engineer {name: $name})-[:INVESTIGATED]->(i:Incident)
+         RETURN i.id AS id, i.title AS title, i.severity AS severity, i.status AS status`,
+        { name },
+      );
+      const uniquelyInvestigated = [];
+      for (const inc of incidentRows) {
+        const otherInv = await query(
+          `MATCH (other:Engineer)-[:INVESTIGATED]->(i:Incident {id: $id})
+           WHERE other.name <> $name
+           RETURN other.name AS name`,
+          { id: inc.id, name },
+        );
+        if (!otherInv.length) {
+          uniquelyInvestigated.push({ id: inc.id, title: inc.title, severity: inc.severity, status: inc.status });
+        }
+      }
+
+      // 5. Recent deployments authored (newest 5) — operational knowledge at risk
+      const deploymentRows = await query(
+        `MATCH (e:Engineer {name: $name})-[:AUTHORED]->(d:Deployment)-[:DEPLOYED_TO]->(s:Service)
+         RETURN d.id AS id, d.version AS version, d.deployedAt AS deployedAt,
+                d.summary AS summary, s.name AS service
+         ORDER BY d.deployedAt DESC LIMIT 5`,
+        { name },
+      );
+
+      // 6. Blast radius: services that depend on any of the engineer's solo-maintained services
+      const dependentRows = soloMaintained.length
+        ? await query(
+            `MATCH (up:Service)-[:DEPENDS_ON*1..3]->(s:Service)
+             WHERE s.name IN $services AND up.name <> s.name
+             RETURN DISTINCT up.name AS dependent, s.name AS ownedService
+             ORDER BY ownedService, dependent`,
+            { services: soloMaintained },
+          )
+        : [];
+
+      return {
+        engineer: name,
+        expertise,
+        ownedServices,
+        soloMaintained,
+        unownedServices,
+        uniquelyInvestigatedIncidents: uniquelyInvestigated,
+        recentDeployments: deploymentRows,
+        dependentServices: dependentRows,
+      };
+    },
+  },
 };
 
 export const TOOL_DEFINITIONS = Object.entries(TOOLS).map(([name, t]) => ({

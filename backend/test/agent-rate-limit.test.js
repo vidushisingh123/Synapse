@@ -21,6 +21,7 @@ function fakeRun() {
       case 'get_recent_deployments': return { service: 'Checkout API', searchedServices: [], deployments: [] };
       case 'get_repositories': return { service: 'Checkout API', repositories: [], servicesWithoutRepository: [] };
       case 'get_engineers': return { service: 'Checkout API', searchedServices: [], engineers: [] };
+      case 'get_offboarding_risk': return { engineer: 'Unknown', expertise: null, ownedServices: [], soloMaintained: [], unownedServices: [], uniquelyInvestigatedIncidents: [], recentDeployments: [], dependentServices: [] };
       default: throw new Error(`unexpected tool ${name}`);
     }
   };

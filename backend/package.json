@@ -9,6 +9,9 @@
     "test-graph": "node test-graph.js",
     "seed-graph": "node seed-graph.js",
     "seed-demo": "node seed-demo.js",
+    "seed-offboarding": "node seed-offboarding.js",
+    "seed-nexuspay": "node seed-nexuspay.js",
+    "seed-all": "node seed-graph.js && node seed-demo.js && node seed-offboarding.js && node seed-nexuspay.js",
     "test-tools": "node test-tools.js",
     "test": "node --test"
   },

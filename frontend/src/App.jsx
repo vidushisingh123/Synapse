@@ -8,9 +8,13 @@ const DEMO =
   'Checkout is failing. Investigate the likely cause, identify affected services, find relevant past incidents, and recommend who should investigate it.';
 const SAMPLES = [
   DEMO,
-  'What does Payment Service depend on?',
-  'Who should I ask about Inventory Service?',
-  'Tell me about INC-087',
+  'If Avery Chen leaves next week, what knowledge is at risk and what handover tasks are most urgent?',
+  'Why is Checkout API experiencing elevated latency?',
+  'What could be affected if Payment Service becomes unavailable?',
+  'Which recent deployments are relevant to authentication failures?',
+  'What do we know about refund processing incidents?',
+  'What services does Riley Moss maintain?',
+  'What ownership gaps exist in the graph?',
 ];
 
 async function api(path, options) {
