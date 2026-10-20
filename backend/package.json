@@ -13,7 +13,8 @@
     "seed-nexuspay": "node seed-nexuspay.js",
     "seed-all": "node seed-graph.js && node seed-demo.js && node seed-offboarding.js && node seed-nexuspay.js",
     "test-tools": "node test-tools.js",
-    "test": "node --test"
+    "test": "node --test",
+    "create-admin": "node create-admin.js"
   },
   "keywords": [],
   "author": "",
@@ -26,7 +27,8 @@
     "dotenv": "^18.0.8",
     "express": "^5.3.0",
     "falkordb": "^6.8.0",
-    "groq-sdk": "^1.6.0"
+    "groq-sdk": "^1.6.0",
+    "jose": "^6.2.12"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"
