@@ -14,7 +14,8 @@
     "seed-all": "node seed-graph.js && node seed-demo.js && node seed-offboarding.js && node seed-nexuspay.js",
     "test-tools": "node test-tools.js",
     "test": "node --test",
-    "create-admin": "node create-admin.js"
+    "create-admin": "node create-admin.js",
+    "create-user": "node create-user.js"
   },
   "keywords": [],
   "author": "",
@@ -23,12 +24,14 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.134.0",
     "@google/genai": "^2.30.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "cors": "^2.8.6",
     "dotenv": "^18.0.8",
     "express": "^5.3.0",
     "falkordb": "^6.8.0",
     "groq-sdk": "^1.6.0",
-    "jose": "^6.2.12"
+    "jose": "^6.2.12",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"

@@ -26,13 +26,21 @@ async function resolveService(input) {
   return hit;
 }
 
-/** The service plus everything it depends on within 2 hops. */
+/**
+ * The service, everything it depends on within 2 hops, and the services that call it directly (1 hop upstream).
+ * Callers are included because a symptom on a service is often caused by its caller (e.g. a gateway
+ * config change), and that evidence would otherwise be invisible to every scoped tool.
+ */
 async function scopeFor(service) {
-  const rows = await query(
+  const down = await query(
     'MATCH (s:Service {name: $name})-[:DEPENDS_ON*1..2]->(d:Service) RETURN DISTINCT d.name AS name',
     { name: service },
   );
-  return [service, ...rows.map((r) => r.name)];
+  const up = await query(
+    'MATCH (u:Service)-[:DEPENDS_ON]->(s:Service {name: $name}) RETURN DISTINCT u.name AS name',
+    { name: service },
+  );
+  return [...new Set([service, ...down.map((r) => r.name), ...up.map((r) => r.name)])];
 }
 
 const serviceInput = {
@@ -72,7 +80,7 @@ export const TOOLS = {
   },
 
   get_related_incidents: {
-    description: 'Past incidents that affected or involved the service or its dependencies (2 hops), with status, severity, root cause and resolution.',
+    description: 'Past incidents that affected or involved the service, its dependencies (2 hops) or its direct callers, with status, severity, root cause and resolution.',
     input_schema: serviceInput,
     async run(input) {
       const service = await resolveService(input?.service);
@@ -101,7 +109,7 @@ export const TOOLS = {
   },
 
   get_recent_deployments: {
-    description: 'Most recent deployments (newest first, max 5) to the service or its dependencies. Useful for finding a likely trigger.',
+    description: 'Most recent deployments (newest first, max 5) to the service, its dependencies or its direct callers. Useful for finding a likely trigger.',
     input_schema: serviceInput,
     async run(input) {
       const service = await resolveService(input?.service);
@@ -119,7 +127,7 @@ export const TOOLS = {
   },
 
   get_repositories: {
-    description: 'Repositories implementing the service and its dependencies. Also lists services with no repository recorded.',
+    description: 'Repositories implementing the service, its dependencies and its direct callers. Also lists services with no repository recorded.',
     input_schema: serviceInput,
     async run(input) {
       const service = await resolveService(input?.service);
@@ -140,7 +148,7 @@ export const TOOLS = {
   },
 
   get_engineers: {
-    description: 'Engineers relevant to the service and its dependencies: repository maintainers, past incident investigators, and deployment authors, ranked by relevance.',
+    description: 'Engineers relevant to the service, its dependencies and its direct callers: repository maintainers, past incident investigators, and deployment authors, ranked by relevance.',
     input_schema: serviceInput,
     async run(input) {
       const service = await resolveService(input?.service);
@@ -337,4 +345,4 @@ export async function getGraphSnapshot() {
     edges.push({ source: a, target: b, type: r.rel });
   }
   return { nodes: [...nodes.values()], edges };
-}
+}

@@ -8,43 +8,11 @@
 //           process listings, so unset it afterwards. No default credentials exist, and the
 //           password is never printed or logged.
 import 'dotenv/config';
-import { createInterface } from 'node:readline/promises';
 import { closeDb } from './src/db.js';
 import { createUserStore, UserExistsError } from './src/auth/users.js';
 import { createAdmin, InputError } from './src/auth/admin.js';
 import { normalizeUsername, usernameError, passwordError } from './src/auth/validation.js';
-
-function promptVisible(label) {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  return rl.question(label).finally(() => rl.close());
-}
-
-function promptHidden(label) {
-  return new Promise((resolve, reject) => {
-    const stdin = process.stdin;
-    stdin.setRawMode(true);
-    stdin.resume();
-    stdin.setEncoding('utf8');
-    process.stdout.write(label);
-    let buf = '';
-    const finish = (fn, value) => {
-      stdin.setRawMode(false);
-      stdin.pause();
-      stdin.removeListener('data', onData);
-      process.stdout.write('\n');
-      fn(value);
-    };
-    const onData = (chunk) => {
-      for (const ch of chunk) {
-        if (ch === '\r' || ch === '\n' || ch === '\u0004') return finish(resolve, buf);
-        if (ch === '\u0003') return finish(reject, new InputError('Cancelled.'));
-        if (ch === '\u007f' || ch === '\b') buf = buf.slice(0, -1);
-        else if (ch >= ' ') buf += ch;
-      }
-    };
-    stdin.on('data', onData);
-  });
-}
+import { promptVisible, promptHidden } from './src/auth/prompt.js';
 
 async function main() {
   const interactive = Boolean(process.stdin.isTTY);
@@ -67,6 +35,9 @@ async function main() {
     const again = await promptHidden('Repeat password: ');
     if (again !== password) throw new InputError('Passwords do not match.');
   }
+  // Validate before touching the database so a bad password is reported as such.
+  const policyError = passwordError(password, username);
+  if (policyError) throw new InputError(policyError);
 
   const store = createUserStore();
   await store.ensureSchema();

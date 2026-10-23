@@ -195,7 +195,11 @@ PORT=4000
 CORS_ORIGIN=http://localhost:5173
 GROQ_API_KEY=your_groq_api_key_here
 GROQ_MODEL=openai/gpt-oss-120b
+JWT_SECRET=generate_a_random_value_of_at_least_32_characters
+JWT_EXPIRES_IN_SECONDS=3600
 ```
+
+`JWT_SECRET` signs login tokens. Generate one with `node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"`. With `NODE_ENV=production` the backend refuses to start if it is missing, shorter than 32 characters, or a placeholder. `backend/.env.example` lists every variable with placeholder values.
 
 Use your own API key locally. **Never commit `.env` or expose credentials in screenshots, logs or the frontend.** Check the actual backend configuration before changing the model name or any environment-variable names.
 
@@ -219,6 +223,16 @@ npm run seed-nexuspay
 ```
 
 The seed scripts populate the synthetic graph used by the demonstrations. Run them against the intended local development database.
+
+### 4b. Create the first admin user
+
+There is no public registration. Create the first account from the backend directory (FalkorDB must be running):
+
+```bash
+npm run create-admin
+```
+
+The script prompts for a username and a hidden password (12-128 characters) and stores only a salted scrypt hash in a separate `synapse_auth` graph. For non-interactive use you can set `SYNAPSE_ADMIN_USERNAME` and `SYNAPSE_ADMIN_PASSWORD`, but environment variables can leak through shell history and process listings, so unset them afterwards. There are no default credentials.
 
 ### 5. Start the backend
 
@@ -281,13 +295,17 @@ Identify knowledge gaps and explore potential risks when an engineer leaves the 
 
 The backend has exposed the following routes during development. Verify them against the current server implementation before using them as a stable external API.
 
-| Endpoint | Purpose |
-|---|---|
-| `GET /api/health` | Health check |
-| `GET /api/graph` | Retrieve graph data |
-| `GET /api/tools` | List available tools |
-| `POST /api/tools/:name` | Invoke a named tool |
-| `POST /api/investigate` | Run an investigation |
+| Endpoint | Access | Purpose |
+|---|---|---|
+| `GET /api/health` | Public (minimal `{status}`); full details with a token | Health check |
+| `POST /api/auth/login` | Public | Exchange `{username, password}` for a short-lived bearer token |
+| `GET /api/auth/me` | Token | Current user |
+| `GET /api/graph` | Token | Retrieve graph data |
+| `GET /api/tools` | Token | List available tools |
+| `POST /api/tools/:name` | Token | Invoke a named tool |
+| `POST /api/investigate` | Token | Run an investigation |
+
+Send the token as `Authorization: Bearer <token>`. Every other `/api/*` path, including ones that do not exist, requires a valid token. Authentication identifies users only; role-based and per-service authorization are not implemented yet, so any signed-in user can currently reach all graph data.
 
 Request and response fields are defined by the current backend implementation.
 

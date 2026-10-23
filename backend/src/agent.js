@@ -190,9 +190,17 @@ function normalise(raw, evidence) {
   if (raw.root_cause && typeof raw.root_cause === 'object') {
     const rc = raw.root_cause;
     const rcEvidence = ids(rc.evidence);
+    // Never let the model claim more than the cited evidence supports.
+    let rcConfidence = rcLevel(rc.confidence);
+    const hasRecordedCause = evidence
+      .filter((e) => rcEvidence.includes(e.id))
+      .some((e) => (e.data?.incidents ?? []).some((i) => i?.rootCause));
+    if (rcConfidence === 'confirmed' && !hasRecordedCause) rcConfidence = rcEvidence.length >= 2 ? 'likely' : 'possible';
+    if (rcConfidence === 'likely' && rcEvidence.length < 2) rcConfidence = 'possible';
+    if (!rcEvidence.length) rcConfidence = 'unknown';
     root_cause = {
       assessment: str(rc.assessment),
-      confidence: rcLevel(rc.confidence),
+      confidence: rcConfidence,
       causal_chain: str(rc.causal_chain),
       evidence: rcEvidence,
       to_confirm: arr(rc.to_confirm).map(String),
@@ -362,13 +370,18 @@ function toolPlan(i) {
   return TOOL_ORDER.filter((t) => plan.has(t));
 }
 
+// "Checkout API" must not also match "API Gateway" just because both contain the word "API".
+const GENERIC_FIRST_WORDS = new Set(['api', 'web', 'app', 'service']);
+
 function mentionedServices(question, names) {
   const hits = [];
   for (const name of names) {
     const first = name.split(' ')[0];
     const m =
       question.match(new RegExp(`\\b${escapeRe(name)}\\b`, 'i')) ||
-      question.match(new RegExp(`\\b${escapeRe(first)}(s|es)?\\b`, 'i'));
+      (GENERIC_FIRST_WORDS.has(first.toLowerCase())
+        ? null
+        : question.match(new RegExp(`\\b${escapeRe(first)}(s|es)?\\b`, 'i')));
     if (m) hits.push({ name, at: m.index });
   }
   return hits.sort((a, b) => a.at - b.at).map((h) => h.name);
@@ -459,6 +472,37 @@ function limitationResult(names, listId, focus, rec, warning) {
 }
 
 // ---------- Graph-only mode: investigation ----------
+
+const SEVERITY_RANK = { critical: 4, high: 3, medium: 2, low: 1 };
+
+// Plain-language symptoms in the question vs. the wording used in incident records.
+const SYMPTOM_PATTERNS = [
+  /\b(delay\w*|slow\w*|latenc\w*|lag\w*|time[ds]?[ -]?out\w*|timing out|p99|sluggish|hang\w*)\b/i,
+  /\b(error\w*|fail\w*|crash\w*|reject\w*|5\d\d|40[13])\b/i,
+  /\b(down|outage\w*|unavailable)\b/i,
+];
+const symptomMatch = (question, text) => SYMPTOM_PATTERNS.some((re) => re.test(question) && re.test(text));
+
+const cites = (text, id) => new RegExp(`\\b${escapeRe(id)}\\b`, 'i').test(String(text ?? ''));
+
+/** Pair each deployment with the past incident whose recorded root cause cites it or closely resembles its change. */
+function correlateDeployments(deployments, incidents) {
+  return deployments.map((d) => {
+    const svcWords = new Set(words(d.service));
+    const depWords = new Set(words(d.summary).filter((w) => !svcWords.has(w)));
+    let best = null;
+    for (const i of incidents) {
+      if (!i.rootCause) continue;
+      const cited = cites(i.rootCause, d.id);
+      const shared = unique(words(i.rootCause)).filter((w) => depWords.has(w));
+      const resembles = i.links.some((l) => l.service === d.service) && shared.length >= 2;
+      if (!cited && !resembles) continue;
+      const score = (cited ? 10 : 0) + shared.length;
+      if (!best || score > best.score) best = { i, shared, cited, score };
+    }
+    return { d, best };
+  });
+}
 
 async function graphOnlyInvestigation(question, rec, warning) {
   const runFn = rec.runFn ?? runTool;
@@ -727,72 +771,81 @@ async function graphOnlyInvestigation(question, rec, warning) {
 
   // Root-cause analysis and hypotheses — failure / change questions only
   let root_cause;
+  let topCandidate = null;
   if (intents.failure || intents.deployment) {
+    // Hypotheses: deployments whose change is cited by (or resembles) a past incident's root cause come first;
+    // otherwise fall back to the most recent deployment in scope, at low confidence.
+    const seenHyp = new Set();
     for (const r of results) {
       const dep = r.get_recent_deployments;
-      const latest = dep?.data.deployments[0];
-      if (!latest) continue;
       const inc = r.get_related_incidents;
-      const svcWords = new Set(words(latest.service));
-      const depWords = new Set(words(latest.summary).filter((w) => !svcWords.has(w)));
-      let best = null;
-      for (const i of inc?.data.incidents ?? []) {
-        if (!i.rootCause || !i.links.some((l) => l.service === latest.service)) continue;
-        const shared = unique(words(i.rootCause)).filter((w) => depWords.has(w));
-        if (shared.length >= 2 && (!best || shared.length > best.shared.length)) best = { i, shared };
+      if (!dep?.data.deployments.length) continue;
+      const ranked = correlateDeployments(dep.data.deployments, inc?.data.incidents ?? []);
+      const matched = ranked.filter((x) => x.best).sort((a, b) => b.best.score - a.best.score).slice(0, 2);
+      const picks = matched.length ? matched : [{ d: dep.data.deployments[0], best: null }];
+      for (const { d, best } of picks) {
+        if (seenHyp.has(d.id)) continue;
+        seenHyp.add(d.id);
+        const where = d.service === r.target ? `to ${r.target}` : `to ${d.service} (in ${r.target}'s investigation scope)`;
+        const link = best
+          ? `${best.cited ? `${best.i.id}'s recorded root cause cites ${d.id}` : `Its change resembles ${best.i.id}'s recorded root cause (shared terms: ${best.shared.join(', ')})`}: "${best.i.rootCause}". `
+          : 'It is the most recent deployment in scope. ';
+        hypotheses.push({
+          text: `${d.id} (${d.service} ${d.version}, ${d.deployedAt}) was deployed ${where}: "${d.summary}". ${link}This is a correlation in the graph, not a confirmed cause.`,
+          confidence: best ? 'medium' : 'low',
+          evidence: best ? [dep.id, inc.id] : [dep.id],
+        });
       }
-      hypotheses.push({
-        text:
-          `${latest.id} (${latest.service} ${latest.version}, ${latest.deployedAt}) is the most recent deployment in ${r.target}'s dependency scope and could be a trigger.` +
-          (best ? ` Its change resembles ${best.i.id}, whose recorded root cause was "${best.i.rootCause}" (shared terms: ${best.shared.join(', ')}).` : '') +
-          ' This is a correlation in the graph, not a confirmed cause.',
-        confidence: best ? 'medium' : 'low',
-        evidence: best ? [dep.id, inc.id] : [dep.id],
-      });
     }
 
-    // Build a structured root_cause for failure questions.
-    // Look for incidents whose rootCause is recorded (strongest signal first).
-    const incidentsWithRootCause = [];
+    // Candidate past incidents, ranked by how directly they match THIS question.
+    const candidates = [];
     for (const r of results) {
-      for (const i of r.get_related_incidents?.data.incidents ?? []) {
-        if (i.rootCause) incidentsWithRootCause.push({ inc: i, evidenceId: r.get_related_incidents.id, target: r.target });
+      const inc = r.get_related_incidents;
+      const dep = r.get_recent_deployments;
+      for (const i of inc?.data.incidents ?? []) {
+        if (!i.rootCause) continue;
+        const asked = focus.incidentIds.includes(i.id);
+        const direct = i.links.some((l) => l.service === r.target && l.relationship === 'AFFECTS');
+        const involved = i.links.some((l) => l.service === r.target);
+        const symptom = symptomMatch(question, `${i.title} ${i.rootCause}`);
+        const citedDep = (dep?.data.deployments ?? []).find((d) => cites(i.rootCause, d.id)) ?? null;
+        const score = (asked ? 10 : 0) + (direct ? 4 : involved ? 2 : 0) + (symptom ? 3 : 0) + (citedDep ? 3 : 0) + (SEVERITY_RANK[i.severity] ?? 0) / 2;
+        candidates.push({ inc: i, evidenceId: inc.id, depEvidenceId: dep?.id, target: r.target, score, asked, direct, symptom, citedDep });
       }
     }
+    candidates.sort((a, b) => b.score - a.score);
 
-    if (incidentsWithRootCause.length) {
-      // Prefer the highest-severity resolved incident — it has a confirmed root cause and resolution.
-      const severityRank = { critical: 4, high: 3, medium: 2, low: 1 };
-      incidentsWithRootCause.sort((a, b) =>
-        (severityRank[b.inc.severity] ?? 0) - (severityRank[a.inc.severity] ?? 0),
-      );
-      const top = incidentsWithRootCause[0];
+    if (candidates.length) {
+      const top = candidates[0];
+      topCandidate = top;
+      const corroboration = [top.asked || top.direct, top.symptom, top.citedDep].filter(Boolean).length;
+      // "confirmed" only when the person asked about that incident and its record is resolved.
+      // A past incident that merely resembles a current symptom is at most "likely".
+      const confidence = top.asked && top.inc.status === 'resolved' ? 'confirmed' : corroboration >= 2 ? 'likely' : 'possible';
       const depChainParts = [];
       for (const r of results) {
         const d = r.get_service_dependencies;
         if (d) {
-          const deps = d.data.dependsOn.slice(0, 3).map((x) => x.name).join(' → ');
-          if (deps) depChainParts.push(`${r.target} → ${deps}`);
+          const deps = d.data.dependsOn.filter((x) => x.depth === 1).map((x) => x.name).join(', ');
+          if (deps) depChainParts.push(`${r.target} depends directly on ${deps}`);
         }
       }
-      const chainText = depChainParts.length
-        ? `Dependency chain: ${depChainParts.join('; ')}. `
-        : '';
-      const hasMatchingHyp = hypotheses.some((h) => h.evidence.length >= 2);
+      const chainText = depChainParts.length ? `${depChainParts.join('; ')}. ` : '';
+      const involvedSvcs = top.inc.links.map((l) => `${l.relationship.toLowerCase()} ${l.service}`).join(', ');
 
       root_cause = {
-        assessment: top.inc.rootCause,
-        confidence: top.inc.status === 'resolved' ? 'confirmed' : 'likely',
-        causal_chain: `${chainText}${top.inc.id} ("${top.inc.title}") recorded root cause: "${top.inc.rootCause}"${top.inc.resolution ? `. Resolution applied: "${top.inc.resolution}"` : '. No resolution recorded yet'}.`,
-        evidence: [top.evidenceId],
+        assessment: `${top.asked ? '' : 'Closest recorded past incident: '}${top.inc.id} (${top.inc.status}) — ${top.inc.rootCause}`,
+        confidence,
+        causal_chain: `${chainText}${top.inc.id} ("${top.inc.title}") ${involvedSvcs}. Recorded root cause: "${top.inc.rootCause}"${top.inc.resolution ? `. Recorded resolution: "${top.inc.resolution}"` : '. No resolution recorded yet'}.`,
+        evidence: unique([top.evidenceId, ...(top.citedDep && top.depEvidenceId ? [top.depEvidenceId] : [])]),
         to_confirm: [
-          'Verify whether the recorded root cause matches the current symptom pattern.',
+          'Verify that the current symptom matches the recorded root cause; this is a past incident, not a diagnosis of the current problem.',
           'Check live error rates and latency dashboards (the graph holds no telemetry).',
-          ...(hasMatchingHyp ? ['Compare the most recent deployment summary with the historical root cause.'] : []),
+          ...(top.citedDep ? [`Check whether ${top.citedDep.id} (or a similar change) is still in effect.`] : []),
         ],
       };
     } else if (hypotheses.length) {
-      // No recorded root cause, but a deployment hypothesis exists — surface as "possible".
       const hyp = hypotheses[0];
       root_cause = {
         assessment: 'No recorded root cause found in graph. A recent deployment change is the most likely candidate based on historical pattern matching.',
@@ -819,10 +872,23 @@ async function graphOnlyInvestigation(question, rec, warning) {
     }
 
     if (intents.failure) {
-      if (!hypotheses.length && !incidentsWithRootCause.length) gaps.push(`The graph holds no deployment or incident evidence that points to a likely cause for ${focus.targets.join(', ')}.`);
+      if (!hypotheses.length && !candidates.length) gaps.push(`The graph holds no deployment or incident evidence that points to a likely cause for ${focus.targets.join(', ')}.`);
+      const hasIncidentEvidence = results.some((r) => r.get_related_incidents);
+      const openIds = unique(results.flatMap((r) => (r.get_related_incidents?.data.incidents ?? [])
+        .filter((i) => i.status !== 'resolved' && i.links.some((l) => l.service === r.target)).map((i) => i.id)));
+      if (hasIncidentEvidence && !openIds.length) {
+        gaps.push(`No open incident is recorded for ${focus.targets.join(', ')}. The incidents listed are past records used for comparison; the graph does not show what is causing the current symptom.`);
+      }
       gaps.push('The graph has no live telemetry (errors, latency, logs), so no cause can be confirmed from it alone.');
     }
   }
+
+  // Services worth checking: those tied to the closest past incident first, then direct dependencies, then direct callers.
+  const depth1 = (rows) => (rows ?? []).filter((x) => x.depth === 1).map((x) => x.name);
+  const directDeps = unique(results.flatMap((r) => depth1(r.get_service_dependencies?.data.dependsOn)));
+  const directCallers = unique(results.flatMap((r) => depth1(r.get_service_dependencies?.data.dependents)));
+  const priority = unique([...(topCandidate ? topCandidate.inc.links.map((l) => l.service) : []), ...directDeps, ...directCallers])
+    .filter((n) => !focus.targets.includes(n));
 
   // Summary, affected services, next steps
   const label = Object.keys(intents).filter((k) => intents[k]).map((k) => INTENT_LABELS[k]).join(', ') || 'overview';
@@ -836,6 +902,9 @@ async function graphOnlyInvestigation(question, rec, warning) {
         ]);
 
   const next = [];
+  if ((intents.failure || intents.dependency) && priority.length) {
+    next.push(`Investigate these services first: ${priority.slice(0, 6).join(', ')} (ordered by involvement in the closest past incident, then direct dependencies, then direct callers).`);
+  }
   if (intents.failure) {
     next.push(`Check live error rates and latency for ${focus.targets[0]} and its direct dependencies (the graph holds no telemetry).`);
     if (root_cause?.confidence === 'confirmed') {
@@ -851,11 +920,18 @@ async function graphOnlyInvestigation(question, rec, warning) {
   if (intents.dependency) next.push('Validate dependency edges against real service configs; the graph may be incomplete.');
   if (!next.length) next.push('Ask a more specific question, e.g. about failures, dependencies, past incidents or owners.');
 
+  const headline =
+    (intents.failure || intents.dependency) && focus.via !== 'engineer name'
+      ? `${intents.failure ? `Graph history only (no live telemetry): ${root_cause ? `${root_cause.assessment} [${root_cause.confidence}].` : 'no recorded cause found.'} ` : ''}` +
+        `Direct dependencies of ${focus.targets.join(', ')}: ${directDeps.join(', ') || 'none recorded'}; direct callers: ${directCallers.join(', ') || 'none recorded'}.` +
+        `${priority.length ? ` Investigate first: ${priority.slice(0, 6).join(', ')}.` : ''} `
+      : '';
+
   return {
     mode: 'graph-only',
     warning,
     report: {
-      summary: `Interpreted as: ${label}. Focus: ${focus.targets.join(', ')} (matched by ${focus.via}). Tools used: ${plan.map((t) => t.replace('get_', '')).join(', ')}. ${facts.length} graph-supported fact(s), ${hypotheses.length} unconfirmed hypothesis(es), ${unique(gaps).length} gap(s).`,
+      summary: `${headline}Interpreted as: ${label}. Focus: ${focus.targets.join(', ')} (matched by ${focus.via}). Tools used: ${plan.map((t) => t.replace('get_', '')).join(', ')}. ${facts.length} graph-supported fact(s), ${hypotheses.length} unconfirmed hypothesis(es), ${unique(gaps).length} gap(s).`,
       affected_services: affected,
       ...(root_cause ? { root_cause } : {}),
       facts,
@@ -872,7 +948,7 @@ async function graphOnlyInvestigation(question, rec, warning) {
   };
 }
 
-export async function investigate(question, { run, client, sleep } = {}) {
+async function runInvestigation(question, { run, client, sleep } = {}) {
   const runFn = typeof run === 'function' ? run : runTool;
   if (process.env.GROQ_API_KEY) {
     try {
@@ -897,4 +973,142 @@ export async function investigate(question, { run, client, sleep } = {}) {
     }
   }
   return graphOnlyInvestigation(question, makeRecorder(runFn), 'GROQ_API_KEY is not set. Showing graph-only analysis.');
+}
+
+// ---------- Response graph (entities + relationships taken only from recorded evidence) ----------
+
+/** Nodes/edges (same `Label:name` ids as /api/graph) derived from the tool results; nothing is inferred. */
+export function buildGraph(evidence = []) {
+  const nodes = new Map();
+  const edges = new Map();
+  const node = (label, name, props = {}) => {
+    if (!name) return null;
+    const id = `${label}:${name}`;
+    const clean = Object.fromEntries(Object.entries(props).filter(([, v]) => v !== undefined && v !== null));
+    nodes.set(id, { ...nodes.get(id), id, label, name, ...clean });
+    return id;
+  };
+  const edge = (source, type, target, evId, extra = {}) => {
+    if (!source || !target || source === target) return;
+    const key = `${source}|${type}|${target}`;
+    const cur = edges.get(key);
+    if (cur) {
+      if (!cur.evidence.includes(evId)) cur.evidence.push(evId);
+      if (!extra.transitive) { delete cur.transitive; delete cur.hops; } // a direct record wins over a path record
+      return;
+    }
+    edges.set(key, { source, target, type, ...extra, evidence: [evId] });
+  };
+  const hop = (d) => (d > 1 ? { transitive: true, hops: d } : {});
+
+  for (const e of evidence) {
+    const d = e.data ?? {};
+    const svc = d.service ? node('Service', d.service) : null;
+    switch (e.tool) {
+      case 'get_service_dependencies':
+        for (const x of d.dependsOn ?? []) edge(svc, 'DEPENDS_ON', node('Service', x.name), e.id, hop(x.depth));
+        for (const x of d.dependents ?? []) edge(node('Service', x.name), 'DEPENDS_ON', svc, e.id, hop(x.depth));
+        break;
+      case 'get_related_incidents':
+        for (const i of d.incidents ?? []) {
+          const inc = node('Incident', i.id, { title: i.title, status: i.status, severity: i.severity });
+          for (const l of i.links ?? []) edge(inc, l.relationship, node('Service', l.service), e.id);
+        }
+        break;
+      case 'get_recent_deployments':
+        for (const x of d.deployments ?? []) {
+          edge(node('Deployment', x.id, { version: x.version, deployedAt: x.deployedAt }), 'DEPLOYED_TO', node('Service', x.service), e.id);
+        }
+        break;
+      case 'get_repositories':
+        for (const x of d.repositories ?? []) edge(node('Service', x.service), 'IMPLEMENTED_IN', node('Repository', x.repository, { url: x.url }), e.id);
+        break;
+      case 'get_engineers':
+        for (const p of d.engineers ?? []) {
+          const eng = node('Engineer', p.name, { expertise: p.expertise });
+          for (const m of p.maintains ?? []) {
+            const repo = node('Repository', m.repository);
+            edge(eng, 'MAINTAINS', repo, e.id);
+            edge(node('Service', m.service), 'IMPLEMENTED_IN', repo, e.id);
+          }
+          for (const x of p.investigated ?? []) edge(eng, 'INVESTIGATED', node('Incident', x.incident), e.id);
+          for (const x of p.authoredDeployments ?? []) {
+            const dep = node('Deployment', x.deployment);
+            edge(eng, 'AUTHORED', dep, e.id);
+            edge(dep, 'DEPLOYED_TO', node('Service', x.service), e.id);
+          }
+        }
+        break;
+      case 'get_offboarding_risk': {
+        const eng = node('Engineer', d.engineer, { expertise: d.expertise });
+        for (const o of d.ownedServices ?? []) {
+          const repo = node('Repository', o.repository);
+          edge(eng, 'MAINTAINS', repo, e.id);
+          edge(node('Service', o.service), 'IMPLEMENTED_IN', repo, e.id);
+        }
+        for (const i of d.uniquelyInvestigatedIncidents ?? []) {
+          edge(eng, 'INVESTIGATED', node('Incident', i.id, { title: i.title, status: i.status, severity: i.severity }), e.id);
+        }
+        for (const x of d.recentDeployments ?? []) {
+          const dep = node('Deployment', x.id, { version: x.version, deployedAt: x.deployedAt });
+          edge(eng, 'AUTHORED', dep, e.id);
+          edge(dep, 'DEPLOYED_TO', node('Service', x.service), e.id);
+        }
+        for (const x of d.dependentServices ?? []) {
+          edge(node('Service', x.dependent), 'DEPENDS_ON', node('Service', x.ownedService), e.id, { transitive: true, maxHops: 3 });
+        }
+        break;
+      }
+      default:
+        break; // search_services only lists names; nothing relational to draw
+    }
+  }
+  return { nodes: [...nodes.values()], edges: [...edges.values()] };
+}
+
+// ---------- Public entry point ----------
+
+export class GraphUnavailableError extends Error {
+  constructor() {
+    super('The graph database is unavailable, so the investigation could not run. Please try again shortly.');
+    this.name = 'GraphUnavailableError';
+    this.status = 503;
+    this.code = 'graph_unavailable';
+    this.expose = true;
+  }
+}
+
+const CONNECTION_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EPIPE', 'EAI_AGAIN']);
+const looksLikeConnectionFailure = (err) =>
+  CONNECTION_CODES.has(err?.code) || /ECONN|ETIMEDOUT|ENOTFOUND|socket|connection (is )?closed|not connected|did not respond|redis|falkor/i.test(String(err?.message));
+
+/** Deliberate errors (validation, RBAC, unknown tool) pass through; connection failures become a clean 503. */
+function toInvestigationError(err) {
+  const deliberate = err instanceof ToolError || err?.expose === true || (Number.isInteger(err?.status) && err.status < 500);
+  if (deliberate) return err;
+  if (looksLikeConnectionFailure(err)) {
+    console.error('Graph database failure during investigation:', redact(err?.message));
+    return new GraphUnavailableError();
+  }
+  return err;
+}
+
+/**
+ * Investigate a question. Response contract (unchanged): { mode, model?, warning?, report, evidence }.
+ * Added, additive only: `graph` = { nodes, edges } built from the recorded evidence.
+ */
+export async function investigate(question, options = {}) {
+  let result;
+  try {
+    result = await runInvestigation(question, options);
+  } catch (err) {
+    throw toInvestigationError(err);
+  }
+  let graph = { nodes: [], edges: [] };
+  try {
+    graph = buildGraph(result.evidence);
+  } catch (err) {
+    console.error('Could not build response graph:', redact(err?.message));
+  }
+  return { ...result, graph };
 }

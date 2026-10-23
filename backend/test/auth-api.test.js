@@ -157,7 +157,10 @@ test('password hashes and plaintext never appear in any response', async () => {
 test('me: valid token returns the current user', async () => {
   const r = await call('/api/auth/me', { token: await validToken() });
   assert.equal(r.status, 200);
-  assert.deepEqual(r.json, { user: { id: admin.id, username: 'ada', role: 'admin' } });
+  assert.deepEqual(r.json, {
+    user: { id: admin.id, username: 'ada', role: 'admin' },
+    permissions: ['graph:read', 'tools:invoke', 'investigate', 'offboarding:read', 'admin:users'],
+  });
 });
 
 test('me: no, malformed, wrong-scheme, garbage, wrong-signature and expired tokens are all 401', async () => {
@@ -286,7 +289,7 @@ test('production 5xx responses are generic; full detail goes to the server log o
   const s = await listen(makeApp({ tools: boom, env }));
   try {
     const token = (await call('/api/auth/login', { method: 'POST', body: { username: 'ada', password: PASSWORD }, origin: urlOf(s) })).json.token;
-    const r = await call('/api/tools/x', { method: 'POST', token, body: {}, origin: urlOf(s) });
+    const r = await call('/api/tools/search_services', { method: 'POST', token, body: {}, origin: urlOf(s) });
     assert.equal(r.status, 500);
     assert.deepEqual(r.json, { error: 'Internal server error.' });
     assert.ok(logs.error.join('\n').includes('s3cr3t'), 'operators still get the detail in logs');
@@ -298,7 +301,7 @@ test('non-production keeps the existing "Server error: <message>" behaviour', as
   const s = await listen(makeApp({ tools: boom }));
   try {
     const token = (await call('/api/auth/login', { method: 'POST', body: { username: 'ada', password: PASSWORD }, origin: urlOf(s) })).json.token;
-    const r = await call('/api/tools/x', { method: 'POST', token, body: {}, origin: urlOf(s) });
+    const r = await call('/api/tools/search_services', { method: 'POST', token, body: {}, origin: urlOf(s) });
     assert.deepEqual(r.json, { error: 'Server error: kaput' });
   } finally { await close(s); }
 });

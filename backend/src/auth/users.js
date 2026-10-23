@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { query, AUTH_GRAPH_NAME } from '../db.js';
+import { ROLES } from './rbac.js';
 
-// Only "admin" exists until Milestone 2 introduces real roles and permissions.
-// The stored role is informational for now: nothing in this milestone authorizes by it.
-export const KNOWN_ROLES = new Set(['admin']);
+// Roles that may be stored. What each role may DO is defined only in rbac.js.
+export const KNOWN_ROLES = new Set(ROLES);
 
 export class UserExistsError extends Error {
   constructor() {

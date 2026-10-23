@@ -3,10 +3,11 @@ import { loadAuthConfig, AuthConfigError } from './config.js';
 import { verifyPassword, verifyAgainstDummy } from './password.js';
 import { issueToken } from './tokens.js';
 import { normalizeUsername, PASSWORD_MAX } from './validation.js';
+import { ROLE_PERMISSIONS, permissionsForRole } from './rbac.js';
 
 const GENERIC_LOGIN_ERROR = 'Invalid username or password.';
 
-export function createAuthRouter({ userStore, requireAuth, env = process.env, logger = console }) {
+export function createAuthRouter({ userStore, requireAuth, rolePermissions = ROLE_PERMISSIONS, env = process.env, logger = console }) {
   const router = Router();
 
   // PUBLIC: exchange credentials for a short-lived bearer token.
@@ -34,9 +35,11 @@ export function createAuthRouter({ userStore, requireAuth, env = process.env, lo
     res.json({ token, tokenType: 'Bearer', expiresIn, user: { id: user.id, username: user.username, role: user.role } });
   });
 
-  // PROTECTED: who am I.
+  // PROTECTED (any authenticated user): who am I, and what may I do.
+  // `permissions` is derived server-side from the stored role so the UI never has to guess;
+  // it is informational only: every operation is still authorized on the server.
   router.get('/me', requireAuth, (req, res) => {
-    res.json({ user: req.user });
+    res.json({ user: req.user, permissions: permissionsForRole(req.user.role, rolePermissions) });
   });
 
   return router;

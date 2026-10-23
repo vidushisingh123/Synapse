@@ -6,6 +6,8 @@ import { investigate } from './agent.js';
 import { createUserStore } from './auth/users.js';
 import { createAuthMiddleware } from './auth/middleware.js';
 import { createAuthRouter } from './auth/routes.js';
+import { createMcpRouter } from './mcp/router.js';
+import { PERMISSIONS, ROLE_PERMISSIONS, requirePermission, createAuthorizedRun } from './auth/rbac.js';
 
 const withTimeout = (promise, ms) =>
   Promise.race([
@@ -20,13 +22,22 @@ const withTimeout = (promise, ms) =>
  * Route policy (deny by default):
  *   PUBLIC     GET  /api/health          minimal { status }; full details only with a valid token
  *   PUBLIC     POST /api/auth/login
- *   PROTECTED  everything else under /api, including paths that do not exist
+ *   AUTH ONLY  GET  /api/auth/me         any authenticated user
+ *   graph:read GET  /api/graph
+ *   tools:invoke  GET /api/tools, POST /api/tools/:name (plus a per-tool permission, e.g. offboarding:read)
+ *   investigate   POST /api/investigate (every tool the agent calls is authorized again, per tool)
+ *   tools:invoke  POST /mcp (MCP Streamable HTTP; only tools the role may use are listed, each call is authorized again)
+ *   anything else under /api, including paths that do not exist, requires a valid token
+ *
+ * Role-level only: a role with a permission can use it against all graph data (service-level
+ * scoping arrives in Milestone 3).
  */
 export function createApp({
   userStore = createUserStore(),
   tools = { TOOL_DEFINITIONS, runTool, getGraphSnapshot },
   investigateFn = investigate,
   queryFn = query,
+  rolePermissions = ROLE_PERMISSIONS,
   env = process.env,
   logger = console,
 } = {}) {
@@ -34,8 +45,13 @@ export function createApp({
   app.disable('x-powered-by');
   app.use(cors({ origin: (env.CORS_ORIGIN || 'http://localhost:5173').split(',') }));
   app.use(express.json({ limit: '10kb' }));
+  // Responses can carry investigation results, graph data or account details: never let a browser or proxy cache them.
+  app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 
   const { requireAuth, optionalAuth } = createAuthMiddleware({ userStore, env, logger });
+  const need = (permission) => requirePermission(permission, { matrix: rolePermissions, logger });
+  // Every tool call, from the HTTP endpoint or from the agent, goes through this per-request runner.
+  const authorizedRun = (req) => createAuthorizedRun(req.user, tools.runTool, { matrix: rolePermissions, logger });
 
   // ---- Public ----
   app.get('/api/health', optionalAuth, async (req, res) => {
@@ -49,29 +65,36 @@ export function createApp({
     }
   });
 
-  app.use('/api/auth', createAuthRouter({ userStore, requireAuth, env, logger }));
+  app.use('/api/auth', createAuthRouter({ userStore, requireAuth, rolePermissions, env, logger }));
+
+  // MCP (Streamable HTTP). Same bearer token and RBAC as /api; set MCP_ENABLED=false to turn it off.
+  if (env.MCP_ENABLED !== 'false') {
+    app.use('/mcp', createMcpRouter({ requireAuth, tools, rolePermissions, env, logger }));
+  }
 
   // ---- Everything below requires a valid token (also covers unknown /api paths) ----
   app.use('/api', requireAuth);
 
-  app.get('/api/graph', async (_req, res) => {
+  app.get('/api/graph', need(PERMISSIONS.GRAPH_READ), async (_req, res) => {
     res.json(await tools.getGraphSnapshot());
   });
 
-  app.get('/api/tools', (_req, res) => {
+  app.get('/api/tools', need(PERMISSIONS.TOOLS_INVOKE), (_req, res) => {
     res.json({ tools: tools.TOOL_DEFINITIONS });
   });
 
-  app.post('/api/tools/:name', async (req, res) => {
-    const data = await tools.runTool(req.params.name, req.body ?? {});
+  app.post('/api/tools/:name', need(PERMISSIONS.TOOLS_INVOKE), async (req, res) => {
+    const data = await authorizedRun(req)(req.params.name, req.body ?? {});
     res.json({ tool: req.params.name, data });
   });
 
-  app.post('/api/investigate', async (req, res) => {
-    const question = String(req.body?.question ?? '').trim();
+  app.post('/api/investigate', need(PERMISSIONS.INVESTIGATE), async (req, res) => {
+    const rawQuestion = req.body?.question;
+    if (typeof rawQuestion !== 'string') throw new ToolError('Please provide "question" as a text string.');
+    const question = rawQuestion.trim();
     if (question.length < 5) throw new ToolError('Please enter a question (at least 5 characters).');
     if (question.length > 500) throw new ToolError('Question is too long (max 500 characters).');
-    res.json({ question, ...(await investigateFn(question)) });
+    res.json({ question, ...(await investigateFn(question, { run: authorizedRun(req) })) });
   });
 
   app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
@@ -85,14 +108,19 @@ export function createApp({
     if (status >= 500) {
       // Full detail stays in the server log only.
       logger.error('[server] request failed:', err);
-      if (err.name === 'AuthConfigError') return res.status(status).json({ error: err.message });
+      if (err.name === 'AuthConfigError' || err.expose === true) {
+        return res.status(status).json({ error: err.message, ...(typeof err.code === 'string' ? { code: err.code } : {}) });
+      }
       return res.status(status).json({ error: production ? 'Internal server error.' : `Server error: ${err.message}` });
     }
     if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid JSON body.' });
     if (err.type === 'entity.too.large') return res.status(413).json({ error: 'Request body too large.' });
     // Only errors we raise on purpose carry client-safe messages.
     const exposable = err.name === 'ToolError' || err.expose === true;
-    res.status(status).json({ error: exposable ? err.message : 'Bad request.' });
+    res.status(status).json({
+      error: exposable ? err.message : 'Bad request.',
+      ...(exposable && typeof err.code === 'string' ? { code: err.code } : {}),
+    });
   });
 
   return app;
